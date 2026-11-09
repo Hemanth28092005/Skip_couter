@@ -1,0 +1,196 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Skip Counter</title>
+<style>
+:root{--bg:#f6f5f1;--card:#fff;--ink:#1c1b19;--mute:#76736b;--acc:#e8590c;--line:#e4e1d8;--ok:#2b8a3e;box-sizing:border-box;padding-top:env(safe-area-inset-top,0px);padding-bottom:env(safe-area-inset-bottom,0px)}
+@media (prefers-color-scheme:dark){:root:not([data-theme="light"]){--bg:#141413;--card:#1f1e1c;--ink:#f1efe8;--mute:#9a968c;--acc:#ff8a3d;--line:#32302c;--ok:#69db7c}}
+:root[data-theme="dark"]{--bg:#141413;--card:#1f1e1c;--ink:#f1efe8;--mute:#9a968c;--acc:#ff8a3d;--line:#32302c;--ok:#69db7c}
+*{box-sizing:border-box}
+html{scroll-padding-top:env(safe-area-inset-top,0px)}
+body{margin:0;background:var(--bg);color:var(--ink);font-family:system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;min-height:100vh}
+main{max-width:480px;margin:0 auto;padding:20px 16px 40px}
+h1{font-size:1.1rem;margin:0 0 16px;font-weight:600;letter-spacing:.02em}
+.card{background:var(--card);border:1px solid var(--line);border-radius:16px;padding:20px;margin-bottom:14px}
+#count{font-size:6.5rem;font-weight:700;text-align:center;line-height:1;font-variant-numeric:tabular-nums}
+#count.pop{animation:pop .12s}
+@keyframes pop{50%{transform:scale(1.06)}}
+.stats{display:flex;justify-content:space-around;margin-top:14px;text-align:center}
+.stats b{display:block;font-size:1.3rem;font-variant-numeric:tabular-nums}
+.stats span,.hint,label{font-size:.8rem;color:var(--mute)}
+#status{text-align:center;margin:10px 0 0;min-height:1.2em;color:var(--mute);font-size:.9rem}
+.meter{height:10px;background:var(--line);border-radius:6px;overflow:hidden;position:relative;margin-top:16px}
+#bar{height:100%;width:0;background:var(--acc);transition:width .05s}
+#thrline{position:absolute;top:0;bottom:0;width:2px;background:var(--ink);opacity:.6;left:50%}
+.row{display:flex;gap:10px;margin-top:16px}
+button{flex:1;font:inherit;font-weight:600;padding:14px;border-radius:12px;border:1px solid var(--line);background:var(--card);color:var(--ink);cursor:pointer}
+button.primary{background:var(--acc);border-color:var(--acc);color:#fff}
+button:disabled{opacity:.5}
+input[type=range]{width:100%;accent-color:var(--acc)}
+.hist-row{display:flex;align-items:center;gap:10px;font-size:.85rem;margin-top:8px}
+.hist-row .d{width:84px;color:var(--mute)}
+.hist-row .b{flex:1;height:10px;background:var(--line);border-radius:6px;overflow:hidden}
+.hist-row .b i{display:block;height:100%;background:var(--ok)}
+.hist-row .n{width:90px;text-align:right;font-variant-numeric:tabular-nums}
+.link{background:none;border:0;color:var(--mute);font-weight:400;font-size:.8rem;padding:0;margin-top:12px;text-decoration:underline;flex:none}
+</style>
+</head>
+<body>
+<main>
+<h1>Skip Counter</h1>
+<div class="card">
+  <div id="count">0</div>
+  <div class="stats">
+    <div><b id="time">0:00</b><span>time</span></div>
+    <div><b id="spm">0</b><span>skips/min</span></div>
+  </div>
+  <div class="meter"><div id="bar"></div><div id="thrline"></div></div>
+  <p id="status">Calibrate once, then start skipping.</p>
+  <div class="row">
+    <button id="calBtn">Calibrate</button>
+    <button id="startBtn" class="primary">Start</button>
+  </div>
+</div>
+<div class="card">
+  <label for="sens">Sensitivity (fine-tune after calibrating)</label>
+  <input id="sens" type="range" min="0.4" max="2.5" step="0.05" value="1">
+  <p class="hint">Higher = counts softer thuds. Lower = ignores small noises. The vertical line on the meter is the trigger level.</p>
+</div>
+<div class="card">
+  <label>Recent sessions</label>
+  <div id="hist"></div>
+  <button id="clr" class="link">Clear history</button>
+</div>
+</main>
+<script>
+(function(){
+var MINGAP=200, ctx=null, an=null, buf=null, stream=null, raf=0;
+var mode='idle', count=0, startT=0, lastHit=-1e9, prev=0, hits=[], thr=0.03, base=0.03, sens=1;
+var noiseSum=0, noiseN=0, calStart=0, peaks=[], pending=null, noise=0.005, wake=null;
+var $=function(id){return document.getElementById(id)};
+
+function setStatus(t){$('status').textContent=t}
+function fmt(s){s=Math.floor(s);return Math.floor(s/60)+':'+String(s%60).padStart(2,'0')}
+function curThr(){return base*sens}
+
+try{var saved=JSON.parse(localStorage.getItem('skip_thr')||'null');if(saved&&saved.base){base=saved.base;noise=saved.noise||noise;$('status').textContent='Using your saved calibration.'}}catch(e){}
+
+async function openMic(){
+  if(ctx&&ctx.state==='suspended')await ctx.resume();
+  if(ctx)return true;
+  try{
+    stream=await navigator.mediaDevices.getUserMedia({audio:{echoCancellation:false,noiseSuppression:false,autoGainControl:false}});
+  }catch(e){setStatus('Microphone blocked. Allow mic access and try again.');return false}
+  ctx=new (window.AudioContext||window.webkitAudioContext)();
+  var src=ctx.createMediaStreamSource(stream);
+  var hp=ctx.createBiquadFilter();hp.type='highpass';hp.frequency.value=100;
+  var lp=ctx.createBiquadFilter();lp.type='lowpass';lp.frequency.value=2500;
+  an=ctx.createAnalyser();an.fftSize=1024;
+  buf=new Float32Array(an.fftSize);
+  src.connect(hp);hp.connect(lp);lp.connect(an);
+  return true;
+}
+
+async function keepAwake(on){
+  try{
+    if(on&&navigator.wakeLock){wake=await navigator.wakeLock.request('screen')}
+    else if(wake){await wake.release();wake=null}
+  }catch(e){}
+}
+
+function loop(){
+  raf=requestAnimationFrame(loop);
+  an.getFloatTimeDomainData(buf);
+  var s=0;for(var i=0;i<buf.length;i++)s+=buf[i]*buf[i];
+  var rms=Math.sqrt(s/buf.length), now=performance.now();
+  var t=mode==='calib'&&!base?0.03:curThr();
+  if(mode==='calib')t=Math.max(noise*3,0.008);
+  $('bar').style.width=Math.min(100,rms/(t*2)*100)+'%';
+  $('thrline').style.left='50%';
+
+  if(mode==='calib'){
+    var el=now-calStart;
+    if(el<1500){noiseSum+=rms;noiseN++;setStatus('Stay quiet for a moment…');if(el>1400&&noiseN){noise=noiseSum/noiseN}return}
+    var left=Math.max(0,Math.ceil((7500-el)/1000));
+    setStatus('Skip normally now… '+left+'s');
+    if(rms>t&&prev<=t&&now-lastHit>MINGAP){lastHit=now;pending={t:now,p:rms}}
+    if(pending){pending.p=Math.max(pending.p,rms);if(now-pending.t>80){peaks.push(pending.p);pending=null}}
+    prev=rms;
+    if(el>7500)finishCal();
+    return;
+  }
+  if(mode==='run'){
+    if(rms>t&&prev<=t&&now-lastHit>MINGAP){
+      lastHit=now;count++;hits.push(now);if(hits.length>12)hits.shift();
+      var c=$('count');c.textContent=count;c.classList.remove('pop');void c.offsetWidth;c.classList.add('pop');
+    }
+    prev=rms;
+    $('time').textContent=fmt((now-startT)/1000);
+    var r=0;
+    if(hits.length>2&&now-hits[hits.length-1]<1500){r=(hits.length-1)/((hits[hits.length-1]-hits[0])/1000)*60}
+    $('spm').textContent=Math.round(r);
+  }
+}
+
+function finishCal(){
+  mode='idle';cancelAnimationFrame(raf);
+  $('calBtn').disabled=false;$('startBtn').disabled=false;
+  if(peaks.length<5){setStatus('Only heard '+peaks.length+' thuds. Move the phone closer to the floor and retry.');return}
+  peaks.sort(function(a,b){return a-b});
+  var med=peaks[Math.floor(peaks.length/2)];
+  base=Math.max(noise+0.5*(med-noise),0.008);
+  try{localStorage.setItem('skip_thr',JSON.stringify({base:base,noise:noise}))}catch(e){}
+  setStatus('Calibrated from '+peaks.length+' skips. Ready to go.');
+  $('bar').style.width='0';
+}
+
+$('calBtn').onclick=async function(){
+  if(mode!=='idle')return;
+  if(!await openMic())return;
+  mode='calib';peaks=[];pending=null;noiseSum=0;noiseN=0;prev=0;lastHit=-1e9;calStart=performance.now();
+  $('calBtn').disabled=true;$('startBtn').disabled=true;
+  loop();
+};
+
+$('startBtn').onclick=async function(){
+  var b=$('startBtn');
+  if(mode==='run'){stop();return}
+  if(mode!=='idle')return;
+  if(!await openMic())return;
+  count=0;hits=[];prev=0;lastHit=-1e9;startT=performance.now();
+  $('count').textContent='0';$('time').textContent='0:00';$('spm').textContent='0';
+  mode='run';b.textContent='Stop';$('calBtn').disabled=true;
+  setStatus('Counting. Start skipping!');keepAwake(true);loop();
+};
+
+function stop(){
+  var secs=(performance.now()-startT)/1000;
+  mode='idle';cancelAnimationFrame(raf);keepAwake(false);
+  $('startBtn').textContent='Start';$('calBtn').disabled=false;$('bar').style.width='0';
+  if(count>0){
+    saveSession({d:Date.now(),n:count,s:Math.round(secs)});
+    setStatus('Saved: '+count+' skips in '+fmt(secs)+'.');
+  }else setStatus('No skips counted. Try calibrating.');
+  renderHist();
+}
+
+function load(){try{return JSON.parse(localStorage.getItem('skip_hist')||'[]')}catch(e){return[]}}
+function saveSession(x){var h=load();h.push(x);try{localStorage.setItem('skip_hist',JSON.stringify(h.slice(-30)))}catch(e){}}
+function renderHist(){
+  var h=load().slice(-8).reverse(),el=$('hist');
+  if(!h.length){el.innerHTML='<p class="hint">No sessions yet.</p>';return}
+  var mx=Math.max.apply(null,h.map(function(x){return x.n}));
+  el.innerHTML=h.map(function(x){
+    var d=new Date(x.d);
+    return '<div class="hist-row"><span class="d">'+d.toLocaleDateString(undefined,{day:'numeric',month:'short'})+' '+d.toLocaleTimeString(undefined,{hour:'2-digit',minute:'2-digit'})+'</span><span class="b"><i style="width:'+(x.n/mx*100)+'%"></i></span><span class="n">'+x.n+' · '+fmt(x.s)+'</span></div>';
+  }).join('');
+}
+$('clr').onclick=function(){try{localStorage.removeItem('skip_hist')}catch(e){}renderHist()};
+$('sens').oninput=function(){sens=parseFloat(this.value)};
+renderHist();
+})();
+</script>
+</body>
+</html>
